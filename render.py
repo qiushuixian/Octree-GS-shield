@@ -94,7 +94,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, resolution_scales=dataset.resolution_scales)
         gaussians.eval()
-        gaussians.plot_levels()
+        
         if dataset.random_background:
             bg_color = [np.random.random(),np.random.random(),np.random.random()] 
         elif dataset.white_background:
