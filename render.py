@@ -47,7 +47,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
         torch.cuda.synchronize(); t0 = time.time()
 
-        gaussians.set_anchor_mask(view.camera_center, iteration, view.resolution_scale)
+        gaussians.additional_mask(view.world_view_transform) 
         gaussians.set_anchor_mask(view.camera_center, iteration, view.resolution_scale)
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
         render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, ape_code=ape_code)
