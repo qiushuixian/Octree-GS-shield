@@ -9,7 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 import config
-import confignew
+
 import time
 from datetime import timedelta
 import torch
