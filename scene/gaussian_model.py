@@ -13,7 +13,7 @@ import confignew
 import time
 from datetime import timedelta
 import torch
-
+import confignew
 from functools import reduce
 import numpy as np
 from torch_scatter import scatter_max
