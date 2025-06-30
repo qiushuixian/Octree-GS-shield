@@ -1,4 +1,4 @@
-name: octree-gs
+name: e0
 channels:
   - pytorch
   - pyg
@@ -9,9 +9,6 @@ dependencies:
   - plyfile=0.8.1
   - python=3.7.13
   - pip=22.3.1
-  - pytorch=1.12.1
-  - torchaudio=0.12.1
-  - torchvision=0.13.1
   - pytorch-scatter
   - tqdm
   - pip:
@@ -22,5 +19,4 @@ dependencies:
     - jaxtyping
     - colorama
     - opencv-python
-    - submodules/diff-gaussian-rasterization
-    - submodules/simple-knn
+
