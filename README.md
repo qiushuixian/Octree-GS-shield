@@ -10,3 +10,6 @@ conda activate e0
 
 接下来参照Octree-GS训练及渲染
 
+7-1:修改：scene/gaussian_model.py开头添加了函数count_nearby_anchors，用于统计一个0级anchor下共有多少anchor(分块进行，目前的chunk_size可以在一张24GB的A10上运行，如果显示显存不足可以改小chunk_size)
+
+
