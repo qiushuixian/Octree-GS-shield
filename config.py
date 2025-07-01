@@ -12,3 +12,5 @@ flag=0
 p0=0
 iteration=0
 num=0
+re=[]
+first=0
