@@ -636,8 +636,8 @@ class GaussianModel:
         # 第一部分：设置超参数及初始化参数
         # ==================================================================
         z_length=25    #视锥体范围  
-        threshold=9.0  #遮挡剪枝阈值
-        delay=0        #识别到阈值第delay个格子开始剪枝
+        threshold=11.0  #遮挡剪枝阈值
+        delay=5.0        #识别到阈值第delay个格子开始剪枝
         total_samples = self._level.shape[0]
         device = self._anchor.device
 
@@ -698,10 +698,8 @@ class GaussianModel:
         coefficients = torch.zeros(total_samples, dtype=torch.float32, device=device)
         zero_level_mask = (self._level.squeeze() == 0)
         coefficients[zero_level_mask] = result.float()  # 0级anchor权重为邻近数量
-        anchor_z_in_view = anchor_new_pos[:, 2]  # 相机空间的z坐标
-        epsilon = 1e-8
-        depth_factor = torch.clamp(anchor_z_in_view * anchor_z_in_view, min=epsilon)
-        dynamic_threshold = threshold * depth_factor  # [total_samples]
+    
+      
         # 标记高权重0级anchor（权重大于阈值）
         high_weight_mask = (coefficients > threshold) & zero_level_mask
         high_weight_anchors = valid_indices[high_weight_mask[valid_indices]]
@@ -719,7 +717,7 @@ class GaussianModel:
                 p, q, r = high_weight_blocks[i]
                 r=anchor_new_pos[:,2][i]
                 if p >= 0 and q >= 0 and r>= 0:
-                    block_occluded[p, q] = min(block_occluded[p, q],r+5.0)  # 设置后续所有z方向块为被遮挡
+                    block_occluded[p, q] = min(block_occluded[p, q],r+delay)  # 设置后续所有z方向块为被遮挡
 
         # ==================================================================
         # 第四部分：生成最终掩码（修改部分）
