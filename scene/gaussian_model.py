@@ -636,8 +636,8 @@ class GaussianModel:
         # 第一部分：设置超参数及初始化参数
         # ==================================================================
         z_length=25    #视锥体范围  
-        threshold=11.0  #遮挡剪枝阈值
-        delay=5.0        #识别到阈值第delay个格子开始剪枝
+        threshold=3.0  #遮挡剪枝阈值
+        delay=0.0      #识别到阈值第delay个格子开始剪枝
         total_samples = self._level.shape[0]
         device = self._anchor.device
 
@@ -668,26 +668,30 @@ class GaussianModel:
         #判断z方向是否在视锥内,并存储z方向格点坐标
         mask_z_valid = (anchor_new_pos[:, 2] >= 0.0) & (anchor_new_pos[:,2]<=z_length)
         z_position= anchor_new_pos[mask_z_valid, 2] // z_block 
-        anchor_block_position[mask_z_valid, 2]=z_position.long()  
+        anchor_block_position[mask_z_valid, 2]=z_position.long() 
+        anchor_block_position[~mask_z_valid, 2]=-1
         #判断x/y方向是否在视锥内,并存储x/y方向格点坐标
         mask_x_valid=torch.abs(anchor_new_pos[:,0])<torch.abs(anchor_new_pos[:,2]*math.tan(confignew.fx_mid/2))
         mask_y_valid=torch.abs(anchor_new_pos[:,1])<torch.abs(anchor_new_pos[:,2]*math.tan(confignew.fy_mid/2))
         valid_indices = (mask_x_valid & mask_y_valid )& mask_z_valid
         invalid_indices=~valid_indices
-
+        print(math.tan(confignew.fx_mid/2))
+        print(math.tan(confignew.fy_mid/2))
         x_position= (anchor_new_pos[valid_indices, 0]*para_xy) // (anchor_new_pos[valid_indices, 2]*math.tan(confignew.fx_mid/2)) + para_xy    
         anchor_block_position[valid_indices, 0]=x_position.long()  
         anchor_block_position[invalid_indices, 0]=-1
 
-        y_position= (anchor_new_pos[valid_indices, 1]*para_xy) // (anchor_new_pos[valid_indices, 2]*math.tan(confignew.fx_mid/2)) + para_xy  
+        y_position= (anchor_new_pos[valid_indices, 1]*para_xy) // (anchor_new_pos[valid_indices, 2]*math.tan(confignew.fy_mid/2)) + para_xy  
         anchor_block_position[valid_indices, 1]=y_position.long()  
         anchor_block_position[invalid_indices, 1]=-1 
         
         #筛选xyz符合要求的anchor
-        in_frustum=torch.all(anchor_block_position>0,axis=1)
-        valid_indices = torch.nonzero(in_frustum, as_tuple=True)[0]
+        in_frustum=torch.all(anchor_block_position>=0,axis=1)
+        
+        valid_indices = torch.where(valid_indices)[0] 
+        #torch.nonzero(in_frustum, as_tuple=True)[0]
         if (config.first==0):
-            count_nearby_anchors(self._level,self._anchor,0.10755540430545807)
+            count_nearby_anchors(self._level,self._anchor,0.10755540430545807/1.5)
         config.first+=1
         result=config.re
         print(result.float().mean())
@@ -698,15 +702,18 @@ class GaussianModel:
         coefficients = torch.zeros(total_samples, dtype=torch.float32, device=device)
         zero_level_mask = (self._level.squeeze() == 0)
         coefficients[zero_level_mask] = result.float()  # 0级anchor权重为邻近数量
-    
+        
       
         # 标记高权重0级anchor（权重大于阈值）
         high_weight_mask = (coefficients > threshold) & zero_level_mask
         high_weight_anchors = valid_indices[high_weight_mask[valid_indices]]
-    
+        print(high_weight_mask.shape)
+        print(valid_indices.shape)
+        print(high_weight_anchors.shape)
+        
         # 初始化遮挡掩码（每个格子是否被遮挡）
         block_occluded = torch.ones((para_xy*2+2, para_xy*2+2), dtype=torch.float, device=device)
-        block_occluded=block_occluded*300
+        block_occluded=block_occluded*1000
         # 对每个高权重0级anchor，设置其后续所有视锥体块为被遮挡
         if high_weight_anchors.numel() > 0:
             # 获取高权重anchor的视锥体块坐标
@@ -715,7 +722,7 @@ class GaussianModel:
             # 对每个高权重anchor，设置其后续所有z方向的块为被遮挡
             for i in range(high_weight_blocks.size(0)):
                 p, q, r = high_weight_blocks[i]
-                r=anchor_new_pos[:,2][i]
+                #r=anchor_new_pos[:,2][i]
                 if p >= 0 and q >= 0 and r>= 0:
                     block_occluded[p, q] = min(block_occluded[p, q],r+delay)  # 设置后续所有z方向块为被遮挡
 
@@ -725,14 +732,16 @@ class GaussianModel:
         # 提取所有anchor的 (p, q, r) 坐标
         p_indices = anchor_block_position[:, 0].long()  # 形状 (total_samples,)
         q_indices = anchor_block_position[:, 1].long()  # 形状 (total_samples,)
-        r_indices = anchor_block_position[:, 2].long()  # 形状 (total_samples,)
+        r_indices = anchor_block_position[:,2].long()  # 形状 (total_samples,)
     
         # 判断anchor所在块是否被遮挡
         final_mask = block_occluded[p_indices, q_indices]<r_indices
-    
-        config.mask_oct[final_mask] = 0  
+        
+        config.mask_oct[final_mask] = 0
+        print(config.mask_oct.float().mean())   
         torch.cuda.empty_cache()
-        return config.mask_oct
+        return config.mask_oct 
+
        
     
     def load_ply_sparse_gaussian(self, path):
