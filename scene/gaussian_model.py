@@ -672,11 +672,15 @@ class GaussianModel:
         anchor_block_position[~mask_z_valid, 2]=-1
         #判断x/y方向是否在视锥内,并存储x/y方向格点坐标
         mask_x_valid=torch.abs(anchor_new_pos[:,0])<torch.abs(anchor_new_pos[:,2]*math.tan(confignew.fx_mid/2))
+
+        #======================
+        #修改1：confignew.fy_mid和confignew.fx_mid不同
+        #======================
+        
         mask_y_valid=torch.abs(anchor_new_pos[:,1])<torch.abs(anchor_new_pos[:,2]*math.tan(confignew.fy_mid/2))
         valid_indices = (mask_x_valid & mask_y_valid )& mask_z_valid
         invalid_indices=~valid_indices
-        print(math.tan(confignew.fx_mid/2))
-        print(math.tan(confignew.fy_mid/2))
+       
         x_position= (anchor_new_pos[valid_indices, 0]*para_xy) // (anchor_new_pos[valid_indices, 2]*math.tan(confignew.fx_mid/2)) + para_xy    
         anchor_block_position[valid_indices, 0]=x_position.long()  
         anchor_block_position[invalid_indices, 0]=-1
@@ -685,11 +689,10 @@ class GaussianModel:
         anchor_block_position[valid_indices, 1]=y_position.long()  
         anchor_block_position[invalid_indices, 1]=-1 
         
-        #筛选xyz符合要求的anchor
-        in_frustum=torch.all(anchor_block_position>=0,axis=1)
+    
         
         valid_indices = torch.where(valid_indices)[0] 
-        #torch.nonzero(in_frustum, as_tuple=True)[0]
+
         if (config.first==0):
             count_nearby_anchors(self._level,self._anchor,0.10755540430545807/1.5)
         config.first+=1
@@ -718,11 +721,15 @@ class GaussianModel:
         if high_weight_anchors.numel() > 0:
             # 获取高权重anchor的视锥体块坐标
             high_weight_blocks = anchor_block_position[high_weight_anchors]
-
+            
             # 对每个高权重anchor，设置其后续所有z方向的块为被遮挡
+            
+            #======================
+            #修改2：统一索引方式，r和r_indices都用anchor_block_position
+            #======================
+            
             for i in range(high_weight_blocks.size(0)):
                 p, q, r = high_weight_blocks[i]
-                #r=anchor_new_pos[:,2][i]
                 if p >= 0 and q >= 0 and r>= 0:
                     block_occluded[p, q] = min(block_occluded[p, q],r+delay)  # 设置后续所有z方向块为被遮挡
 
