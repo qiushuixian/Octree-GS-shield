@@ -30,7 +30,7 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
-
+import config
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, show_level, ape_code):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     makedirs(render_path, exist_ok=True)
@@ -43,12 +43,16 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     t_list = []
     per_view_dict = {}
     per_view_level_dict = {}
+    config.is_training=0
+    print(f"render0")
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
 
         torch.cuda.synchronize(); t0 = time.time()
-
+        config.fx_mid=view.FoVx
+        config.fy_mid=view.FoVy
         gaussians.additional_mask(view.world_view_transform) 
         gaussians.set_anchor_mask(view.camera_center, iteration, view.resolution_scale)
+        
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
         render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, ape_code=ape_code)
         
@@ -94,7 +98,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, resolution_scales=dataset.resolution_scales)
         gaussians.eval()
-        
+        gaussians.plot_levels()
         if dataset.random_background:
             bg_color = [np.random.random(),np.random.random(),np.random.random()] 
         elif dataset.white_background:
