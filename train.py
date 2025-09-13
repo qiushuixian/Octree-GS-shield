@@ -33,7 +33,7 @@ import torchvision.transforms.functional as tf
 import lpips
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import prefilter_voxel, render, network_gui
+from gaussian_renderer import prefilter_voxel, render, generate_neural_gaussians_no_mask,network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -42,7 +42,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-
+import config
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
 
@@ -99,8 +99,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    config.is_training=1
     for iteration in range(first_iter, opt.iterations + 1):        
         # network gui not available in octree-gs yet
+        if (iteration%499==0):
+            print(f"{iteration}:{gaussians._anchor.shape}")
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -143,7 +146,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
-
+        
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
 
@@ -204,7 +207,40 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            
+            if  (iteration==5001):
+                xyz, color, opacity_n, scaling, rot, neural_opacity, mask = generate_neural_gaussians_no_mask(viewpoint_cam, gaussians, None, is_training=True)
+                imp_score = torch.zeros(xyz.shape[0]).cuda()
+            
+                scaling_prod = scaling.prod(dim=1)
+                
+            
+                opacity_n=opacity_n.flatten().abs()
+                score = ((opacity_n**11)*scaling_prod).abs()
+                
+                
+                
+                imp_score=score
+                imp_score = imp_score.unfold(0, size=10, step=10).sum(dim=1)
+                prob = imp_score/imp_score.sum()
+                prob = prob.detach().cpu().numpy()
 
+                factor=0.4
+                
+                threshold = torch.quantile(imp_score, factor)
+                # 创建掩码，保留得分大于等于阈值的点
+                mask = imp_score >= threshold
+                # 转换为numpy数组
+                mask = mask.cpu().numpy()
+                
+                
+                config.fast_prune=1
+                gaussians.prune_anchor(~mask)     
+                config.fast_prune=0  
+                gaussians.reinitial_anchor()      
+                torch.cuda.empty_cache()
+
+            
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
