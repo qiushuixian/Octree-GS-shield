@@ -8,12 +8,10 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-import config
-import confignew
+
 import time
 from datetime import timedelta
 import torch
-
 from functools import reduce
 import numpy as np
 from torch_scatter import scatter_max
@@ -28,59 +26,7 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
 from einops import repeat
 import math
-import torch
-
-import torch
-
-def count_nearby_anchors(levels, anchors, threshold, chunk_size=20000):
-    """
-    分块计算每个0级anchor周围的邻近anchor数量，避免内存溢出
-    
-    参数:
-    levels (torch.Tensor): n*1的等级数组 (device: CPU/GPU)
-    anchors (torch.Tensor): n*3的坐标数组 (device: 需与levels一致)
-    threshold (float): 距离阈值
-    chunk_size: 分块大小，根据GPU内存调整
-    
-    返回:
-    torch.Tensor: 每个0级anchor的邻近anchor数量（一维张量）
-    """
-    # 设备一致性检查
-    device = levels.device
-    assert anchors.device == device, "levels和anchors必须在同一设备上"
-    
-    # 筛选0级anchor
-    zero_mask = (levels == 0).squeeze()
-    zero_indices = torch.where(zero_mask)[0]
-    zero_anchors = anchors[zero_mask]
-    
-    # 边界情况处理
-    n_zero = zero_anchors.size(0)
-    if n_zero == 0:
-        return torch.tensor([], device=device)
-    n_total = anchors.size(0)
-    if n_total == 0:
-        return torch.zeros(n_zero, dtype=torch.long, device=device)
-    
-    # 初始化结果数组
-    nearby_counts = torch.zeros(n_zero, dtype=torch.long, device=device)
-    
-    # 分块处理anchors
-    for i in range(0, n_total, chunk_size):
-        # 获取当前块
-        chunk = anchors[i:min(i+chunk_size, n_total)]
-        chunk_size_actual = chunk.size(0)
-        
-        # 计算当前块到所有0级anchor的距离
-        dist_chunk = torch.cdist(zero_anchors, chunk, p=1)  # [n_zero, chunk_size_actual]
-        
-        # 统计当前块中的邻近anchor数量
-        nearby_chunk = (dist_chunk < threshold).sum(dim=1)
-        
-        # 累加到结果
-        nearby_counts += nearby_chunk
-    
-    config.re= nearby_counts
+import config
 
 class GaussianModel:
 
@@ -118,8 +64,7 @@ class GaussianModel:
                  progressive: bool = True,
                  extend: float = 1.1
                  ):
-        
-        
+
         self.feat_dim = feat_dim
         self.view_dim = 3
         self.n_offsets = n_offsets
@@ -195,10 +140,6 @@ class GaussianModel:
                 nn.Linear(self.feat_dim, 3*self.n_offsets),
                 nn.Sigmoid()
             ).cuda()
-
-    import torch
-
-    
 
     def eval(self):
         self.mlp_opacity.eval()
@@ -441,56 +382,133 @@ class GaussianModel:
         weed_mask = (visible_count > self.visible_threshold)
         mean_visible = torch.mean(visible_count)
         return anchor_positions[weed_mask], anchor_levels[weed_mask], mean_visible, weed_mask
+
+    def set_anchor_mask(self, cam_center, iteration, resolution_scale):
+        anchor_pos = self._anchor + (self.voxel_size/2) / (float(self.fork) ** self._level)
+        dist = torch.sqrt(torch.sum((anchor_pos - cam_center)**2, dim=1)) * resolution_scale
+        pred_level = torch.log2(self.standard_dist/dist)/math.log2(self.fork) + self._extra_level
+        
+        is_training = self.get_color_mlp.training
+        if self.progressive and is_training:
+            coarse_index = np.searchsorted(self.coarse_intervals, iteration) + 1 + self.init_level
+        else:
+            coarse_index = self.levels
+
+        int_level = self.map_to_int_level(pred_level, coarse_index - 1)
+        self._anchor_mask = (self._level.squeeze(dim=1) <= int_level)
+        
+        if (config.is_training==0):
+            print(f"pruning")
+            mask_oct = torch.tensor(config.mask_oct, dtype=torch.bool, device=self._anchor_mask.device)
+            self._anchor_mask = self._anchor_mask & mask_oct
+
+    def additional_mask(self,viewmatrix):
+        # ==================================================================
+        # 第一部分：设置超参数及初始化参数
+        # ==================================================================
+        z_length=25    #视锥体范围  
+        threshold=0.0  #遮挡剪枝阈值
+        delay=1.0      #识别到阈值第delay个格子开始剪枝
+        total_samples = self._level.shape[0]
+        device = self._anchor.device
+        # ==================================================================
+        # 第二部分：坐标变换(世界坐标->相机坐标->视锥体格点)
+        # ==================================================================
+        viewmatrix = torch.tensor(viewmatrix, device=self._anchor.device)
+        # 将锚点坐标转换为齐次坐标 [n, 4]
+        anchor_homogeneous = torch.cat([self._anchor, torch.ones_like(self._anchor[:, :1])], dim=1)
+        # 执行视图矩阵变换 [n, 4] @ [4, 4] -> [n, 4]
+        view_space_homogeneous = torch.matmul(anchor_homogeneous,viewmatrix)
+        # 提取变换后的三维坐标 [n, 4] -> [n, 3]
+        anchor_new_pos = view_space_homogeneous[:, :3]
+        
+        #生成一个256*256*128的张量
+        para_xy = 80
+        para_z = 80
+        z_block =z_length/para_z
+        #mask_out:被遮挡anchor,1表示遮挡,0表示不遮挡,和原代相反
+        config.mask_oct = torch.ones(total_samples, dtype=torch.bool, device=device)   
+        #anchor_block_position:存储anchor在视锥体的哪个格子,x/y方向数值为-1到255的整数,z方向为-1到127的整数,-1表示不在视锥内
+        anchor_block_position = torch.zeros((total_samples,3), dtype=torch.bool, device=device)
+        anchor_block_position=anchor_block_position.long()
+        #anchor_num_in_block:格子内部anchor加权求和
+        #anchor_num_in_block = torch.zeros((para_xy*2+2, para_xy*2+2, para_z+2), dtype=torch.long, device=device)
+        #anchor_num_in_block=anchor_num_in_block.float()
+
+        #判断z方向是否在视锥内,并存储z方向格点坐标
+        mask_z_valid = (anchor_new_pos[:, 2] >= 0.0) & (anchor_new_pos[:,2]<=z_length)
+        z_position= anchor_new_pos[mask_z_valid, 2] // z_block 
+        anchor_block_position[mask_z_valid, 2]=z_position.long() 
+        anchor_block_position[~mask_z_valid, 2]=-1
+        #判断x/y方向是否在视锥内,并存储x/y方向格点坐标
+        mask_x_valid=torch.abs(anchor_new_pos[:,0])<torch.abs(anchor_new_pos[:,2]*math.tan(config.fx_mid/2))
+        mask_y_valid=torch.abs(anchor_new_pos[:,1])<torch.abs(anchor_new_pos[:,2]*math.tan(config.fy_mid/2))
+        valid_indices = (mask_x_valid & mask_y_valid )& mask_z_valid
+        invalid_indices=~valid_indices
+        
+        x_position= (anchor_new_pos[valid_indices, 0]*para_xy) // (anchor_new_pos[valid_indices, 2]*math.tan(config.fx_mid/2)) + para_xy    
+        anchor_block_position[valid_indices, 0]=x_position.long()  
+        anchor_block_position[invalid_indices, 0]=-1
+
+        y_position= (anchor_new_pos[valid_indices, 1]*para_xy) // (anchor_new_pos[valid_indices, 2]*math.tan(config.fy_mid/2)) + para_xy  
+        anchor_block_position[valid_indices, 1]=y_position.long()  
+        anchor_block_position[invalid_indices, 1]=-1 
+        
+        #筛选xyz符合要求的anchor
+        in_frustum=torch.all(anchor_block_position>=0,axis=1)
+        
+        valid_indices = torch.where(valid_indices)[0] 
+        #torch.nonzero(in_frustum, as_tuple=True)[0]
+        
+        # ==================================================================
+        # 第三部分：计算视锥体格子内加权（修改部分）
+        # ==================================================================
+        # 0级anchor的权重直接使用result，其他等级权重为0
+        coefficients = torch.zeros(total_samples, dtype=torch.float32, device=device)
+        zero_level_mask = (self._level.squeeze() < 3)
+        coefficients[zero_level_mask] =1.0  # 0级anchor权重为邻近数量
+        
+        
+     
+        # 标记高权重0级anchor（权重大于阈值）
+        high_weight_mask = (coefficients > threshold) & zero_level_mask
+        
+        high_weight_anchors = valid_indices[high_weight_mask[valid_indices]]
+        
+        
+        # 初始化遮挡掩码（每个格子是否被遮挡）
+        block_occluded = torch.ones((para_xy*2+2, para_xy*2+2), dtype=torch.float, device=device)
+        block_occluded=block_occluded*1000
+        # 对每个高权重0级anchor，设置其后续所有视锥体块为被遮挡
+        if high_weight_anchors.numel() > 0:
+            # 获取高权重anchor的视锥体块坐标
+            high_weight_blocks = anchor_block_position[high_weight_anchors]
+
+            # 对每个高权重anchor，设置其后续所有z方向的块为被遮挡
+            for i in range(high_weight_blocks.size(0)):
+                p, q, r = high_weight_blocks[i]
+                #r=anchor_new_pos[:,2][i]
+                if p >= 0 and q >= 0 and r>= 0:
+                    block_occluded[p, q] = min(block_occluded[p, q],r+delay)  # 设置后续所有z方向块为被遮挡
+
+        # ==================================================================
+        # 第四部分：生成最终掩码（修改部分）
+        # ==================================================================
+        # 提取所有anchor的 (p, q, r) 坐标
+        p_indices = anchor_block_position[:, 0].long()  # 形状 (total_samples,)
+        q_indices = anchor_block_position[:, 1].long()  # 形状 (total_samples,)
+        r_indices = anchor_block_position[:,2].long()  # 形状 (total_samples,)
     
-    #self._anchor_mask.sum().item()在最后一行
-    '''
-    def set_anchor_mask(self, cam_center, iteration, resolution_scale):
-        anchor_pos = self._anchor + (self.voxel_size/2) / (float(self.fork) ** self._level)
-        dist = torch.sqrt(torch.sum((anchor_pos - cam_center)**2, dim=1)) * resolution_scale
-        pred_level = torch.log2(self.standard_dist/dist)/math.log2(self.fork) + self._extra_level
+        # 判断anchor所在块是否被遮挡
+        final_mask = block_occluded[p_indices, q_indices]<r_indices
         
-        is_training = self.get_color_mlp.training
-        if self.progressive and is_training:
-            coarse_index = np.searchsorted(self.coarse_intervals, iteration) + 1 + self.init_level
-        else:
-            coarse_index = self.levels
-
-        int_level = self.map_to_int_level(pred_level, coarse_index - 1)
-        self._anchor_mask = (self._level.squeeze(dim=1) <= int_level)
-        
-        if (confignew.flag_mask==1):
-            print(f'before_addmask:{self._anchor_mask.sum().item()}')
-            mask_oct_tensor = torch.tensor(config.mask_oct).to(self._anchor_mask.device)
-            self._anchor_mask = self._anchor_mask & ~mask_oct_tensor
-            print(f'after_addmask:{self._anchor_mask.sum().item()}')
-        
-    '''
-    def set_anchor_mask(self, cam_center, iteration, resolution_scale):
-        anchor_pos = self._anchor + (self.voxel_size/2) / (float(self.fork) ** self._level)
-        dist = torch.sqrt(torch.sum((anchor_pos - cam_center)**2, dim=1)) * resolution_scale
-        pred_level = torch.log2(self.standard_dist/dist)/math.log2(self.fork) + self._extra_level
-        
-        is_training = self.get_color_mlp.training
-        if self.progressive and is_training:
-            coarse_index = np.searchsorted(self.coarse_intervals, iteration) + 1 + self.init_level
-        else:
-            coarse_index = self.levels
-
-        int_level = self.map_to_int_level(pred_level, coarse_index - 1)
-        self._anchor_mask = (self._level.squeeze(dim=1) <= int_level)
-        
-        mask_oct = torch.tensor(config.mask_oct, dtype=torch.bool, device=self._anchor_mask.device)
-        
-        #print(f'before_addmask:{self._anchor_mask.sum().item()}')
-        #confignew.before_mask_sum+=self._anchor_mask.sum().item()
-        #before_num=self._anchor_mask.sum().item()
-        self._anchor_mask = self._anchor_mask & mask_oct
-        #after_num=self._anchor_mask.sum().item()
-        #print(f'after_addmask:{self._anchor_mask.sum().item()}')
-        #confignew.after_mask_sum+=self._anchor_mask.sum().item()
-        
-        
-        
+        config.mask_oct[final_mask] = 0
+        config.mask_oct[self._level.squeeze()<3]=1
+        torch.cuda.empty_cache()
+        return config.mask_oct 
+    
+    
+    
     def set_anchor_mask_perlevel(self, cam_center, resolution_scale, cur_level):
         anchor_pos = self._anchor + (self.voxel_size/2) / (float(self.fork) ** self._level)
         dist = torch.sqrt(torch.sum((anchor_pos - cam_center)**2, dim=1)) * resolution_scale
@@ -626,131 +644,11 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
-    
-        
-        import torch
+    def plot_levels(self):
+        for level in range(self.levels):
+            level_mask = (self._level == level).squeeze(dim=1)
+            print(f'Level {level}: {torch.sum(level_mask).item()}, Ratio: {torch.sum(level_mask).item()/self._level.shape[0]}')
 
-    
-    def additional_mask(self,viewmatrix):
-        # ==================================================================
-        # 第一部分：设置超参数及初始化参数
-        # ==================================================================
-        z_length=25    #视锥体范围  
-        threshold=3.0  #遮挡剪枝阈值
-        delay=0.0      #识别到阈值第delay个格子开始剪枝
-        total_samples = self._level.shape[0]
-        device = self._anchor.device
-
-        # ==================================================================
-        # 第二部分：坐标变换(世界坐标->相机坐标->视锥体格点)
-        # ==================================================================
-        viewmatrix = torch.tensor(viewmatrix, device=self._anchor.device)
-        # 将锚点坐标转换为齐次坐标 [n, 4]
-        anchor_homogeneous = torch.cat([self._anchor, torch.ones_like(self._anchor[:, :1])], dim=1)
-        # 执行视图矩阵变换 [n, 4] @ [4, 4] -> [n, 4]
-        view_space_homogeneous = torch.matmul(anchor_homogeneous,viewmatrix)
-        # 提取变换后的三维坐标 [n, 4] -> [n, 3]
-        anchor_new_pos = view_space_homogeneous[:, :3]
-
-        #生成一个256*256*128的张量
-        para_xy = 80
-        para_z = 80
-        z_block =z_length/para_z
-        #mask_out:被遮挡anchor,1表示遮挡,0表示不遮挡,和原代相反
-        config.mask_oct = torch.ones(total_samples, dtype=torch.bool, device=device)   
-        #anchor_block_position:存储anchor在视锥体的哪个格子,x/y方向数值为-1到255的整数,z方向为-1到127的整数,-1表示不在视锥内
-        anchor_block_position = torch.zeros((total_samples,3), dtype=torch.bool, device=device)
-        anchor_block_position=anchor_block_position.long()
-        #anchor_num_in_block:格子内部anchor加权求和
-        #anchor_num_in_block = torch.zeros((para_xy*2+2, para_xy*2+2, para_z+2), dtype=torch.long, device=device)
-        #anchor_num_in_block=anchor_num_in_block.float()
-
-        #判断z方向是否在视锥内,并存储z方向格点坐标
-        mask_z_valid = (anchor_new_pos[:, 2] >= 0.0) & (anchor_new_pos[:,2]<=z_length)
-        z_position= anchor_new_pos[mask_z_valid, 2] // z_block 
-        anchor_block_position[mask_z_valid, 2]=z_position.long() 
-        anchor_block_position[~mask_z_valid, 2]=-1
-        #判断x/y方向是否在视锥内,并存储x/y方向格点坐标
-        mask_x_valid=torch.abs(anchor_new_pos[:,0])<torch.abs(anchor_new_pos[:,2]*math.tan(confignew.fx_mid/2))
-
-        #======================
-        #修改1：confignew.fy_mid和confignew.fx_mid不同
-        #======================
-        
-        mask_y_valid=torch.abs(anchor_new_pos[:,1])<torch.abs(anchor_new_pos[:,2]*math.tan(confignew.fy_mid/2))
-        valid_indices = (mask_x_valid & mask_y_valid )& mask_z_valid
-        invalid_indices=~valid_indices
-       
-        x_position= (anchor_new_pos[valid_indices, 0]*para_xy) // (anchor_new_pos[valid_indices, 2]*math.tan(confignew.fx_mid/2)) + para_xy    
-        anchor_block_position[valid_indices, 0]=x_position.long()  
-        anchor_block_position[invalid_indices, 0]=-1
-
-        y_position= (anchor_new_pos[valid_indices, 1]*para_xy) // (anchor_new_pos[valid_indices, 2]*math.tan(confignew.fy_mid/2)) + para_xy  
-        anchor_block_position[valid_indices, 1]=y_position.long()  
-        anchor_block_position[invalid_indices, 1]=-1 
-        
-    
-        
-        valid_indices = torch.where(valid_indices)[0] 
-
-        if (config.first==0):
-            count_nearby_anchors(self._level,self._anchor,0.10755540430545807/1.5)
-        config.first+=1
-        result=config.re
-        print(result.float().mean())
-        # ==================================================================
-        # 第三部分：计算视锥体格子内加权（修改部分）
-        # ==================================================================
-        # 0级anchor的权重直接使用result，其他等级权重为0
-        coefficients = torch.zeros(total_samples, dtype=torch.float32, device=device)
-        zero_level_mask = (self._level.squeeze() == 0)
-        coefficients[zero_level_mask] = result.float()  # 0级anchor权重为邻近数量
-        
-      
-        # 标记高权重0级anchor（权重大于阈值）
-        high_weight_mask = (coefficients > threshold) & zero_level_mask
-        high_weight_anchors = valid_indices[high_weight_mask[valid_indices]]
-        print(high_weight_mask.shape)
-        print(valid_indices.shape)
-        print(high_weight_anchors.shape)
-        
-        # 初始化遮挡掩码（每个格子是否被遮挡）
-        block_occluded = torch.ones((para_xy*2+2, para_xy*2+2), dtype=torch.float, device=device)
-        block_occluded=block_occluded*1000
-        # 对每个高权重0级anchor，设置其后续所有视锥体块为被遮挡
-        if high_weight_anchors.numel() > 0:
-            # 获取高权重anchor的视锥体块坐标
-            high_weight_blocks = anchor_block_position[high_weight_anchors]
-            
-            # 对每个高权重anchor，设置其后续所有z方向的块为被遮挡
-            
-            #======================
-            #修改2：统一索引方式，r和r_indices都用anchor_block_position
-            #======================
-            
-            for i in range(high_weight_blocks.size(0)):
-                p, q, r = high_weight_blocks[i]
-                if p >= 0 and q >= 0 and r>= 0:
-                    block_occluded[p, q] = min(block_occluded[p, q],r+delay)  # 设置后续所有z方向块为被遮挡
-
-        # ==================================================================
-        # 第四部分：生成最终掩码（修改部分）
-        # ==================================================================
-        # 提取所有anchor的 (p, q, r) 坐标
-        p_indices = anchor_block_position[:, 0].long()  # 形状 (total_samples,)
-        q_indices = anchor_block_position[:, 1].long()  # 形状 (total_samples,)
-        r_indices = anchor_block_position[:,2].long()  # 形状 (total_samples,)
-    
-        # 判断anchor所在块是否被遮挡
-        final_mask = block_occluded[p_indices, q_indices]<r_indices
-        
-        config.mask_oct[final_mask] = 0
-        print(config.mask_oct.float().mean())   
-        torch.cuda.empty_cache()
-        return config.mask_oct 
-
-       
-    
     def load_ply_sparse_gaussian(self, path):
         plydata = PlyData.read(path)
 
@@ -885,23 +783,26 @@ class GaussianModel:
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
                 self.optimizer.state[group['params'][0]] = stored_state
+                
                 if group['name'] == "scaling":
                     scales = group["params"][0]
                     temp = scales[:,3:]
                     temp[temp>0.05] = 0.05
                     group["params"][0][:,3:] = temp
+                
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
                 group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                
                 if group['name'] == "scaling":
                     scales = group["params"][0]
                     temp = scales[:,3:]
                     temp[temp>0.05] = 0.05
                     group["params"][0][:,3:] = temp
+                
                 optimizable_tensors[group["name"]] = group["params"][0]
             
         return optimizable_tensors
-
     def prune_anchor(self,mask):
         valid_points_mask = ~mask
 
@@ -915,6 +816,18 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         self._level = self._level[valid_points_mask]    
         self._extra_level = self._extra_level[valid_points_mask]
+       
+        if config.fast_prune==1:
+            if hasattr(self, 'opacity_accum'):
+                self.opacity_accum = self.opacity_accum[valid_points_mask]
+            if hasattr(self, 'opacity_accum'):
+                self.anchor_demon=self.anchor_demon[valid_points_mask]
+            valid_points_mask_new = torch.from_numpy(valid_points_mask).unsqueeze(dim=1).repeat([1, self.n_offsets]).view(-1)
+            if hasattr(self, 'offset_gradient_accum'):
+                self.offset_gradient_accum=self.offset_gradient_accum[valid_points_mask_new]
+            if hasattr(self, 'offset_denom'):
+                self.offset_denom=self.offset_denom[valid_points_mask_new]
+    
     
     def get_remove_duplicates(self, grid_coords, selected_grid_coords_unique, use_chunk = True):
         if use_chunk:
@@ -1169,3 +1082,18 @@ class GaussianModel:
                 self.embedding_appearance.load_state_dict(checkpoint['appearance'])
         else:
             raise NotImplementedError
+    def reinitial_anchor(self):
+        positions=self._anchor
+        offsets = torch.zeros((positions.shape[0], self.n_offsets, 3)).float().cuda()
+        dist2 = torch.clamp_min(distCUDA2(positions).float().cuda(), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6)
+        rots = torch.zeros((positions.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+        opacities = inverse_sigmoid(0.1 * torch.ones((self.positions.shape[0], 1), dtype=torch.float, device="cuda"))
+
+       
+        self._offset = nn.Parameter(offsets.requires_grad_(True))
+        
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(False))
+        self._opacity = nn.Parameter(opacities.requires_grad_(False))
